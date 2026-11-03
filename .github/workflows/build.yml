@@ -49,6 +49,8 @@ jobs:
           android.useAndroidX=true
           android.nonTransitiveRClass=true
           kotlin.code.style=official
+          org.gradle.parallel=true
+          org.gradle.caching=true
           SCOUT_EOF
 
           mkdir -p app
@@ -193,12 +195,14 @@ jobs:
                       )
                       return
                   }
+
                   if (Build.VERSION.SDK_INT >= 33 &&
                       checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                   ) {
                       requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), reqNotif)
                       return
                   }
+
                   launchCapture()
               }
 
@@ -210,11 +214,13 @@ jobs:
               @Deprecated("Deprecated in Java")
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
                   super.onActivityResult(requestCode, resultCode, data)
+
                   when (requestCode) {
                       reqOverlay -> {
                           if (Settings.canDrawOverlays(this)) begin()
                           else status.text = "Falta el permiso de mostrar sobre otras apps."
                       }
+
                       reqCapture -> {
                           if (resultCode == RESULT_OK && data != null) {
                               val svc = Intent(this, ScoutService::class.java)
@@ -230,9 +236,16 @@ jobs:
               }
 
               @Deprecated("Deprecated in Java")
-              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-                  if (requestCode == reqNotif && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                  if (requestCode == reqNotif &&
+                      grantResults.isNotEmpty() &&
+                      grantResults[0] == PackageManager.PERMISSION_GRANTED
+                  ) {
                       launchCapture()
                   }
               }
@@ -273,15 +286,28 @@ jobs:
                   text.typeface = Typeface.DEFAULT_BOLD
               }
 
-              fun update(pixels: IntArray, mw: Int, mh: Int, newLabels: List<Label>, newInfo: String) {
-                  val cur = maskBmp
-                  val b: Bitmap =
-                      if (cur != null && cur.width == mw && cur.height == mh) cur
-                      else Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888).also { maskBmp = it }
-                  b.setPixels(pixels, 0, mw, 0, 0, mw, mh)
-                  labels = newLabels
-                  info = newInfo
-                  postInvalidate()
+              fun update(
+                  pixels: IntArray,
+                  mw: Int,
+                  mh: Int,
+                  newLabels: List<Label>,
+                  newInfo: String
+              ) {
+                  post {
+                      val current = maskBmp
+                      val bitmap =
+                          if (current != null && current.width == mw && current.height == mh) {
+                              current
+                          } else {
+                              Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888)
+                                  .also { maskBmp = it }
+                          }
+
+                      bitmap.setPixels(pixels, 0, mw, 0, 0, mw, mh)
+                      labels = newLabels
+                      info = newInfo
+                      invalidate()
+                  }
               }
 
               fun updateInfo(newInfo: String) {
@@ -318,6 +344,54 @@ jobs:
           SCOUT_EOF
 
           mkdir -p app/src/main/java/com/scout/overlay
+          cat > app/src/main/java/com/scout/overlay/TemporalMaskStabilizer.kt << 'SCOUT_EOF'
+          package com.scout.overlay
+
+          class TemporalMaskStabilizer(private val requiredFrames: Int = 2) {
+              init {
+                  require(requiredFrames >= 1)
+              }
+
+              private var stable: ByteArray? = null
+              private var candidate = ByteArray(0)
+              private var streak = IntArray(0)
+
+              fun apply(input: ByteArray): ByteArray {
+                  if (stable == null || stable!!.size != input.size) {
+                      stable = input.copyOf()
+                      candidate = input.copyOf()
+                      streak = IntArray(input.size)
+                      return stable!!.copyOf()
+                  }
+
+                  val current = stable!!
+                  for (i in input.indices) {
+                      val value = input[i]
+
+                      if (value == current[i]) {
+                          candidate[i] = value
+                          streak[i] = 0
+                      } else {
+                          if (candidate[i] != value) {
+                              candidate[i] = value
+                              streak[i] = 1
+                          } else {
+                              streak[i]++
+                          }
+
+                          if (streak[i] >= requiredFrames) {
+                              current[i] = value
+                              streak[i] = 0
+                          }
+                      }
+                  }
+
+                  return current.copyOf()
+              }
+          }
+          SCOUT_EOF
+
+          mkdir -p app/src/main/java/com/scout/overlay
           cat > app/src/main/java/com/scout/overlay/MaskProcessor.kt << 'SCOUT_EOF'
           package com.scout.overlay
 
@@ -325,6 +399,7 @@ jobs:
           class MaskResult(val pixels: IntArray, val blobs: List<Blob>)
 
           object MaskProcessor {
+
               fun process(
                   mask: ByteArray,
                   w: Int,
@@ -388,6 +463,7 @@ jobs:
                       val rgb = palette[cls % palette.size] and 0x00FFFFFF
                       val fill = (fillAlpha shl 24) or rgb
                       val edge = (0xFF shl 24) or rgb
+
                       for (i in 0 until tail) {
                           val p = queue[i]
                           val x = p % w
@@ -398,6 +474,7 @@ jobs:
                               (mask[p + 1].toInt() and 0xFF) != cls ||
                               (mask[p - w].toInt() and 0xFF) != cls ||
                               (mask[p + w].toInt() and 0xFF) != cls
+
                           pixels[p] = if (isEdge) edge else fill
                       }
 
@@ -483,6 +560,8 @@ jobs:
               private var thread: HandlerThread? = null
               private var handler: Handler? = null
 
+              private val maskStabilizer = TemporalMaskStabilizer(requiredFrames = 2)
+
               private var capW = 0
               private var capH = 0
               private var dpi = 0
@@ -513,6 +592,7 @@ jobs:
                       stopSelf()
                       return START_NOT_STICKY
                   }
+
                   startAsForeground()
                   if (running) return START_NOT_STICKY
 
@@ -522,10 +602,12 @@ jobs:
                   } else {
                       intent?.getParcelableExtra<Intent>("data")
                   }
+
                   if (data == null) {
                       stopSelf()
                       return START_NOT_STICKY
                   }
+
                   running = true
 
                   val th = HandlerThread("scout")
@@ -591,6 +673,7 @@ jobs:
                       "Detener",
                       stopPi
                   ).build()
+
                   val n = Notification.Builder(this, CHANNEL)
                       .setContentTitle("Scout Overlay activo")
                       .setContentText("Analizando la pantalla. Toca Detener para terminar.")
@@ -598,6 +681,7 @@ jobs:
                       .addAction(action)
                       .setOngoing(true)
                       .build()
+
                   if (Build.VERSION.SDK_INT >= 29) {
                       startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
                   } else {
@@ -646,21 +730,21 @@ jobs:
                   val oldH = capH
                   computeSize()
                   if (oldW == capW && oldH == capH) return
+
                   try {
                       val nr = newReader()
-                      val newDisplay = virtualDisplay?.let { prev ->
-                          val proj = projection ?: return@let null
-                          proj.createVirtualDisplay(
-                              "scout",
-                              capW,
-                              capH,
-                              dpi,
-                              DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                              nr.surface,
-                              null,
-                              handler
-                          )
-                      }
+                      val proj = projection ?: return
+                      val newDisplay = proj.createVirtualDisplay(
+                          "scout",
+                          capW,
+                          capH,
+                          dpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          nr.surface,
+                          null,
+                          handler
+                      )
+
                       virtualDisplay?.release()
                       virtualDisplay = newDisplay
                       reader?.close()
@@ -692,6 +776,7 @@ jobs:
                       val pad = p.rowStride - p.pixelStride * w
                       val full = Bitmap.createBitmap(w + pad / p.pixelStride, h, Bitmap.Config.ARGB_8888)
                       full.copyPixelsFromBuffer(p.buffer)
+
                       bmp = if (pad == 0) {
                           full
                       } else {
@@ -710,25 +795,31 @@ jobs:
                   try {
                       val res = seg.segment(BitmapImageBuilder(b).build())
                       val maskImg: MPImage? = res.categoryMask().orElse(null)
+
                       if (maskImg != null) {
                           val mw = maskImg.width
                           val mh = maskImg.height
                           val buf = ByteBufferExtractor.extract(maskImg)
                           val n = mw * mh
+
                           if (buf.capacity() >= n) {
                               val arr = ByteArray(n)
                               for (i in 0 until n) arr[i] = buf.get(i)
 
-                              val result = MaskProcessor.process(arr, mw, mh, PALETTE, MIN_AREA, FILL_ALPHA)
+                              val stabilized = maskStabilizer.apply(arr)
+                              val result = MaskProcessor.process(stabilized, mw, mh, PALETTE, MIN_AREA, FILL_ALPHA)
 
                               val labels = ArrayList<OverlayView.Label>()
                               val counts = LinkedHashMap<String, Int>()
+
                               for (bl in result.blobs) {
                                   val name = if (bl.cls < NAMES.size) NAMES[bl.cls] else "objeto"
                                   labels.add(
                                       OverlayView.Label(
-                                          bl.x.toFloat() / mw, bl.y.toFloat() / mh,
-                                          name, PALETTE[bl.cls % PALETTE.size]
+                                          bl.x.toFloat() / mw,
+                                          bl.y.toFloat() / mh,
+                                          name,
+                                          PALETTE[bl.cls % PALETTE.size]
                                       )
                                   )
                                   counts[name] = (counts[name] ?: 0) + 1
@@ -786,9 +877,9 @@ jobs:
           set +e
           gradle assembleDebug --no-daemon --stacktrace > build.log 2>&1
           code=$?
-          tail -n 60 build.log
+          tail -n 80 build.log
           if [ "$code" -ne 0 ]; then
-            grep -E "^e: |What went wrong|Execution failed|Could not |error:|Caused by" build.log | head -12 | while IFS= read -r line; do
+            grep -E "^e: |What went wrong|Execution failed|Could not |error:|Caused by" build.log | head -15 | while IFS= read -r line; do
               echo "::error::${line}"
             done
             {
