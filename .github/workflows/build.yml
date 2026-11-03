@@ -763,7 +763,23 @@ jobs:
           gradle-version: '8.7'
 
       - name: Compilar APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          set +e
+          gradle assembleDebug --no-daemon --stacktrace > build.log 2>&1
+          code=$?
+          tail -n 60 build.log
+          if [ "$code" -ne 0 ]; then
+            grep -E "^e: |What went wrong|Execution failed|Could not |error:|Caused by" build.log | head -12 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+            {
+              echo "### Errores de compilacion"
+              echo '```'
+              grep -n -E "^e: |What went wrong|Execution failed|Could not |error:|Caused by|^> " build.log | head -40
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $code
 
       - uses: actions/upload-artifact@v4
         with:
