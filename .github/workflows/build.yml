@@ -78,12 +78,12 @@ jobs:
                   jvmTarget = "17"
               }
               androidResources {
-                  noCompress += "tflite"
+                  noCompress += "onnx"
               }
           }
 
           dependencies {
-              implementation("com.google.mediapipe:tasks-vision:0.10.14")
+              implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
           }
           SCOUT_EOF
 
@@ -166,7 +166,7 @@ jobs:
                   status.setPadding(0, pad, 0, pad)
                   status.text = "1) Toca Iniciar\n2) Acepta los permisos\n" +
                       "3) En la ventana de captura elige \"Toda la pantalla\"\n" +
-                      "4) Abre DJI Fly: las detecciones aparecen encima del video\n\n" +
+                      "4) Abre DJI Fly: las siluetas aparecen encima del video\n\n" +
                       "Para terminar: Detener (aquí o en la notificación)."
 
                   val start = Button(this)
@@ -245,44 +245,48 @@ jobs:
           package com.scout.overlay
 
           import android.content.Context
+          import android.graphics.Bitmap
           import android.graphics.Canvas
           import android.graphics.Color
           import android.graphics.Paint
           import android.graphics.RectF
           import android.graphics.Typeface
           import android.view.View
+          import kotlin.math.max
 
           class OverlayView(context: Context) : View(context) {
 
-              class Box(
-                  val l: Float,
-                  val t: Float,
-                  val r: Float,
-                  val b: Float,
-                  val label: String,
-                  val score: Float,
-                  val color: Int
-              )
+              class Label(val x: Float, val y: Float, val text: String, val color: Int)
 
-              @Volatile private var boxes: List<Box> = emptyList()
+              private var maskBmp: Bitmap? = null
+              @Volatile private var labels: List<Label> = emptyList()
               @Volatile private var info: String = "Scout: iniciando..."
 
               private val d = resources.displayMetrics.density
-              private val stroke = Paint(Paint.ANTI_ALIAS_FLAG)
               private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
               private val text = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
               init {
-                  stroke.style = Paint.Style.STROKE
-                  stroke.strokeWidth = 2.5f * d
                   fill.style = Paint.Style.FILL
                   text.color = Color.WHITE
                   text.textSize = 12f * d
                   text.typeface = Typeface.DEFAULT_BOLD
               }
 
-              fun update(newBoxes: List<Box>, newInfo: String) {
-                  boxes = newBoxes
+              // pixels: imagen ARGB de la máscara (mw x mh). Se estira sobre toda la pantalla.
+              fun update(pixels: IntArray, mw: Int, mh: Int, newLabels: List<Label>, newInfo: String) {
+                  val cur = maskBmp
+                  val b: Bitmap =
+                      if (cur != null && cur.width == mw && cur.height == mh) cur
+                      else Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888).also { maskBmp = it }
+                  b.setPixels(pixels, 0, mw, 0, 0, mw, mh)
+                  labels = newLabels
+                  info = newInfo
+                  postInvalidate()
+              }
+
+              fun updateInfo(newInfo: String) {
                   info = newInfo
                   postInvalidate()
               }
@@ -291,18 +295,16 @@ jobs:
                   val w = width.toFloat()
                   val h = height.toFloat()
 
-                  for (bx in boxes) {
-                      val rect = RectF(bx.l * w, bx.t * h, bx.r * w, bx.b * h)
-                      stroke.color = bx.color
-                      c.drawRect(rect, stroke)
+                  maskBmp?.let { c.drawBitmap(it, null, RectF(0f, 0f, w, h), bmpPaint) }
 
-                      val label = bx.label + " " + (bx.score * 100).toInt() + "%"
-                      val tw = text.measureText(label)
+                  for (lb in labels) {
+                      val tw = text.measureText(lb.text)
                       val th = text.textSize + 6 * d
-                      val top = if (rect.top - th < 0f) rect.top else rect.top - th
-                      fill.color = bx.color
-                      c.drawRect(rect.left, top, rect.left + tw + 8 * d, top + th, fill)
-                      c.drawText(label, rect.left + 4 * d, top + th - 6 * d, text)
+                      val px = (lb.x * w).coerceIn(0f, max(0f, w - tw - 8 * d))
+                      val py = (lb.y * h - th).coerceAtLeast(0f)
+                      fill.color = lb.color
+                      c.drawRect(px, py, px + tw + 8 * d, py + th, fill)
+                      c.drawText(lb.text, px + 4 * d, py + th - 6 * d, text)
                   }
 
                   val iw = text.measureText(info)
@@ -313,6 +315,86 @@ jobs:
                       8 * d, 8 * d, fill
                   )
                   c.drawText(info, 16 * d, 8 * d + text.textSize + 6 * d, text)
+              }
+          }
+          SCOUT_EOF
+
+          mkdir -p app/src/main/java/com/scout/overlay
+          cat > app/src/main/java/com/scout/overlay/MaskProcessor.kt << 'SCOUT_EOF'
+          package com.scout.overlay
+
+          class Blob(val cls: Int, val x: Int, val y: Int, val area: Int)
+
+          class MaskResult(val pixels: IntArray, val blobs: List<Blob>)
+
+          // Convierte la máscara de clases (0 = fondo) en una imagen ARGB con relleno suave y borde
+          // sólido, y encuentra cada "mancha" (una persona, un carro...) para etiquetarla y contarla.
+          object MaskProcessor {
+
+              fun process(
+                  mask: ByteArray,
+                  w: Int,
+                  h: Int,
+                  palette: IntArray,
+                  minArea: Int,
+                  fillAlpha: Int
+              ): MaskResult {
+                  val n = w * h
+                  val pixels = IntArray(n)
+                  val seen = BooleanArray(n)
+                  val queue = IntArray(n)
+                  val blobs = ArrayList<Blob>()
+
+                  for (start in 0 until n) {
+                      val cls = mask[start].toInt() and 0xFF
+                      if (cls == 0 || seen[start]) continue
+
+                      var head = 0
+                      var tail = 0
+                      queue[tail++] = start
+                      seen[start] = true
+                      while (head < tail) {
+                          val p = queue[head++]
+                          val x = p % w
+                          val y = p / w
+                          if (x > 0) {
+                              val q = p - 1
+                              if (!seen[q] && (mask[q].toInt() and 0xFF) == cls) { seen[q] = true; queue[tail++] = q }
+                          }
+                          if (x < w - 1) {
+                              val q = p + 1
+                              if (!seen[q] && (mask[q].toInt() and 0xFF) == cls) { seen[q] = true; queue[tail++] = q }
+                          }
+                          if (y > 0) {
+                              val q = p - w
+                              if (!seen[q] && (mask[q].toInt() and 0xFF) == cls) { seen[q] = true; queue[tail++] = q }
+                          }
+                          if (y < h - 1) {
+                              val q = p + w
+                              if (!seen[q] && (mask[q].toInt() and 0xFF) == cls) { seen[q] = true; queue[tail++] = q }
+                          }
+                      }
+
+                      if (tail < minArea) continue  // ruido: no se dibuja
+
+                      val rgb = palette[cls % palette.size] and 0x00FFFFFF
+                      val fill = (fillAlpha shl 24) or rgb
+                      val edge = (0xFF shl 24) or rgb
+                      for (i in 0 until tail) {
+                          val p = queue[i]
+                          val x = p % w
+                          val y = p / w
+                          val isEdge =
+                              x == 0 || x == w - 1 || y == 0 || y == h - 1 ||
+                                  (mask[p - 1].toInt() and 0xFF) != cls ||
+                                  (mask[p + 1].toInt() and 0xFF) != cls ||
+                                  (mask[p - w].toInt() and 0xFF) != cls ||
+                                  (mask[p + w].toInt() and 0xFF) != cls
+                          pixels[p] = if (isEdge) edge else fill
+                      }
+                      blobs.add(Blob(cls, start % w, start / w, tail))
+                  }
+                  return MaskResult(pixels, blobs)
               }
           }
           SCOUT_EOF
@@ -350,9 +432,11 @@ jobs:
           import android.view.WindowManager
           import android.widget.Toast
           import com.google.mediapipe.framework.image.BitmapImageBuilder
+          import com.google.mediapipe.framework.image.ByteBufferExtractor
+          import com.google.mediapipe.framework.image.MPImage
           import com.google.mediapipe.tasks.core.BaseOptions
           import com.google.mediapipe.tasks.vision.core.RunningMode
-          import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
+          import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenter
           import kotlin.math.max
           import kotlin.math.roundToInt
 
@@ -362,31 +446,28 @@ jobs:
                   const val ACTION_STOP = "com.scout.overlay.STOP"
                   private const val CHANNEL = "scout"
                   private const val MAX_SIDE = 800          // lado mayor de la captura (menos = más rápido)
-                  private const val MIN_INTERVAL_MS = 90L   // pausa mínima entre análisis (menos CPU)
-                  private const val THRESHOLD = 0.40f       // confianza mínima
-                  private const val MAX_RESULTS = 25
+                  private const val MIN_INTERVAL_MS = 60L   // pausa mínima entre análisis (menos CPU)
+                  private const val MIN_AREA = 30           // manchas más pequeñas (en píxeles) se ignoran
+                  private const val FILL_ALPHA = 90         // transparencia del relleno de la silueta (0-255)
 
                   private val PALETTE = intArrayOf(
                       Color.rgb(255, 64, 64), Color.rgb(0, 200, 120), Color.rgb(64, 160, 255),
-                      Color.rgb(255, 170, 0), Color.rgb(190, 100, 255), Color.rgb(0, 190, 210)
+                      Color.rgb(255, 170, 0), Color.rgb(190, 100, 255), Color.rgb(0, 190, 210),
+                      Color.rgb(255, 90, 180), Color.rgb(160, 220, 40)
                   )
 
-                  private val ES = mapOf(
-                      "person" to "persona", "bicycle" to "bicicleta", "car" to "carro",
-                      "motorcycle" to "moto", "airplane" to "avión", "bus" to "bus",
-                      "train" to "tren", "truck" to "camión", "boat" to "bote",
-                      "bird" to "ave", "cat" to "gato", "dog" to "perro", "horse" to "caballo",
-                      "cow" to "vaca", "sheep" to "oveja", "backpack" to "mochila",
-                      "umbrella" to "sombrilla", "bottle" to "botella", "chair" to "silla",
-                      "couch" to "sofá", "bed" to "cama", "tv" to "tv", "laptop" to "portátil",
-                      "cell phone" to "celular"
+                  // Clases del modelo (PASCAL VOC), en su orden. El 0 es el fondo.
+                  private val NAMES = arrayOf(
+                      "fondo", "avión", "bicicleta", "ave", "bote", "botella", "bus", "carro",
+                      "gato", "silla", "vaca", "mesa", "perro", "caballo", "moto", "persona",
+                      "planta", "oveja", "sofá", "tren", "tv"
                   )
               }
 
               private var projection: MediaProjection? = null
               private var virtualDisplay: VirtualDisplay? = null
               private var reader: ImageReader? = null
-              private var detector: ObjectDetector? = null
+              private var segmenter: ImageSegmenter? = null
               private var overlay: OverlayView? = null
               private var wm: WindowManager? = null
               private var dm: DisplayManager? = null
@@ -397,6 +478,7 @@ jobs:
               private var capH = 0
               private var dpi = 0
               private var lastRun = 0L
+              private var prevStart = 0L
               private var fps = 0f
               private var running = false
 
@@ -451,13 +533,13 @@ jobs:
                   // Cargar el modelo en el hilo de análisis
                   h.post {
                       try {
-                          val options = ObjectDetector.ObjectDetectorOptions.builder()
+                          val options = ImageSegmenter.ImageSegmenterOptions.builder()
                               .setBaseOptions(BaseOptions.builder().setModelAssetPath("model.tflite").build())
                               .setRunningMode(RunningMode.IMAGE)
-                              .setMaxResults(MAX_RESULTS)
-                              .setScoreThreshold(THRESHOLD)
+                              .setOutputCategoryMask(true)
+                              .setOutputConfidenceMasks(false)
                               .build()
-                          detector = ObjectDetector.createFromOptions(this, options)
+                          segmenter = ImageSegmenter.createFromOptions(this, options)
                       } catch (e: Exception) {
                           Handler(Looper.getMainLooper()).post {
                               Toast.makeText(this, "Error cargando el modelo: " + e.message, Toast.LENGTH_LONG).show()
@@ -569,8 +651,6 @@ jobs:
                   }
               }
 
-              private var prevStart = 0L
-
               private fun onFrame(rd: ImageReader) {
                   val image = try {
                       rd.acquireLatestImage()
@@ -579,8 +659,8 @@ jobs:
                   } ?: return
 
                   val now = SystemClock.elapsedRealtime()
-                  val det = detector
-                  if (det == null || now - lastRun < MIN_INTERVAL_MS) {
+                  val seg = segmenter
+                  if (seg == null || now - lastRun < MIN_INTERVAL_MS) {
                       image.close()
                       return
                   }
@@ -608,34 +688,43 @@ jobs:
                   val b = bmp ?: return
 
                   try {
-                      val res = det.detect(BitmapImageBuilder(b).build())
-                      val out = ArrayList<OverlayView.Box>()
-                      val counts = LinkedHashMap<String, Int>()
-                      for (d in res.detections()) {
-                          val c = d.categories().firstOrNull() ?: continue
-                          val raw: String = c.categoryName() ?: continue
-                          val name = ES[raw] ?: raw
-                          val bb = d.boundingBox()
-                          val color = PALETTE[(raw.hashCode() and 0x7fffffff) % PALETTE.size]
-                          out.add(
-                              OverlayView.Box(
-                                  bb.left / b.width, bb.top / b.height,
-                                  bb.right / b.width, bb.bottom / b.height,
-                                  name, c.score(), color
-                              )
-                          )
-                          counts[name] = (counts[name] ?: 0) + 1
-                      }
+                      val res = seg.segment(BitmapImageBuilder(b).build())
+                      val maskImg: MPImage? = res.categoryMask().orElse(null)
+                      if (maskImg != null) {
+                          val mw = maskImg.width
+                          val mh = maskImg.height
+                          val buf = ByteBufferExtractor.extract(maskImg)
+                          val n = mw * mh
+                          if (buf.capacity() >= n) {
+                              val arr = ByteArray(n)
+                              for (i in 0 until n) arr[i] = buf.get(i)
 
-                      if (prevStart != 0L) {
-                          val inst = 1000f / max(1L, now - prevStart)
-                          fps = if (fps == 0f) inst else fps * 0.8f + inst * 0.2f
-                      }
-                      prevStart = now
+                              val result = MaskProcessor.process(arr, mw, mh, PALETTE, MIN_AREA, FILL_ALPHA)
 
-                      var info = "Scout " + fps.roundToInt() + " fps"
-                      for ((k, v) in counts) info += " · $k $v"
-                      overlay?.update(out, info)
+                              val labels = ArrayList<OverlayView.Label>()
+                              val counts = LinkedHashMap<String, Int>()
+                              for (bl in result.blobs) {
+                                  val name = if (bl.cls < NAMES.size) NAMES[bl.cls] else "objeto"
+                                  labels.add(
+                                      OverlayView.Label(
+                                          bl.x.toFloat() / mw, bl.y.toFloat() / mh,
+                                          name, PALETTE[bl.cls % PALETTE.size]
+                                      )
+                                  )
+                                  counts[name] = (counts[name] ?: 0) + 1
+                              }
+
+                              if (prevStart != 0L) {
+                                  val inst = 1000f / max(1L, now - prevStart)
+                                  fps = if (fps == 0f) inst else fps * 0.8f + inst * 0.2f
+                              }
+                              prevStart = now
+
+                              var info = "Scout " + fps.roundToInt() + " fps"
+                              for ((k, v) in counts) info += " · $k $v"
+                              overlay?.update(result.pixels, mw, mh, labels, info)
+                          }
+                      }
                   } catch (e: Exception) {
                       // un cuadro fallido no detiene el análisis
                   } finally {
@@ -657,16 +746,16 @@ jobs:
                       thread?.quitSafely()
                       thread?.join(800)
                   } catch (e: Exception) {}
-                  try { detector?.close() } catch (e: Exception) {}
+                  try { segmenter?.close() } catch (e: Exception) {}
                   super.onDestroy()
               }
           }
           SCOUT_EOF
 
-      - name: Descargar el modelo de deteccion
+      - name: Descargar el modelo de siluetas
         run: |
           mkdir -p app/src/main/assets
-          curl -fL -o app/src/main/assets/model.tflite https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite
+          curl -fL -o app/src/main/assets/model.tflite https://storage.googleapis.com/mediapipe-models/image_segmenter/deeplab_v3/float32/1/deeplab_v3.tflite
           ls -la app/src/main/assets
 
       - uses: gradle/actions/setup-gradle@v4
